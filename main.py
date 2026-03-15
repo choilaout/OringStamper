@@ -23,24 +23,25 @@ from PIL import Image, ImageTk
 import cv2
 import json, os, shutil, threading, time, sys
 from datetime import datetime
+from collections import deque
 
 # ── Platform detect ───────────────────────────────────────────────────────────
 _IS_PI = os.path.exists("/sys/firmware/devicetree/base/model")
 
 # ── GPIO ─────────────────────────────────────────────────────────────────────
 # GPIO_BLOCK_START  ← uncomment everything between the two markers on Pi
-try:
-    import RPi.GPIO as GPIO
-    GPIO.setmode(GPIO.BCM)
-    GPIO.setup(27, GPIO.IN,  pull_up_down=GPIO.PUD_UP)   # STAMP button
-    GPIO.setup(17, GPIO.OUT, initial=GPIO.HIGH)            # relay (active LOW)
-    _HAS_GPIO = True
-    print("[GPIO] initialised OK")
-except Exception as _e:
-    print(f"[GPIO] not available: {_e}")
-    _HAS_GPIO = False
-GPIO_BLOCK_END
-# _HAS_GPIO = False   # ← remove / comment this line when deploying on Pi
+# try:
+#     import RPi.GPIO as GPIO
+#     GPIO.setmode(GPIO.BCM)
+#     GPIO.setup(27, GPIO.IN,  pull_up_down=GPIO.PUD_UP)   # STAMP button
+#     GPIO.setup(17, GPIO.OUT, initial=GPIO.HIGH)            # relay (active LOW)
+#     _HAS_GPIO = True
+#     print("[GPIO] initialised OK")
+# except Exception as _e:
+#     print(f"[GPIO] not available: {_e}")
+#     _HAS_GPIO = False
+# GPIO_BLOCK_END
+_HAS_GPIO = False   # ← remove / comment this line when deploying on Pi
 
 # ── paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
@@ -48,6 +49,7 @@ TEMPLATE_DIR  = os.path.join(BASE_DIR, "template")
 STALE_DIR     = os.path.join(BASE_DIR, "template_stale")
 ROI_FILE      = os.path.join(BASE_DIR, "roi.json")
 SETTINGS_FILE = os.path.join(BASE_DIR, "appsetting.json")
+LOG_FILE      = os.path.join(BASE_DIR, "app.log")
 
 os.makedirs(TEMPLATE_DIR, exist_ok=True)
 os.makedirs(STALE_DIR,    exist_ok=True)
@@ -65,6 +67,7 @@ TMPL_KEYS          = ["s1",     "s2",     "s3",     "s4"]
 THRESH_MIN         = 50
 THRESH_MAX         = 95
 MATCH_FREQ_VALUES  = list(range(2, 25))
+LOG_MAX_LINES      = 300   # max lines kept in memory / shown in widget
 
 STEPS = [
     (0, "Waiting: NO product"),
@@ -84,32 +87,95 @@ DEFAULT_SETTINGS = {
     "s3": dict(_S_DEF), "s4": dict(_S_DEF),
 }
 
+# ── Log level colours (tag name → fg colour) ──────────────────────────────────
+LOG_COLOURS = {
+    "INFO":    "#cccccc",
+    "OK":      "#44ff88",
+    "WARN":    "#ffcc00",
+    "ERROR":   "#ff5555",
+    "CAMERA":  "#55aaff",
+    "MATCH":   "#aaffcc",
+    "GPIO":    "#ff99ff",
+    "STAMP":   "#ffaa44",
+    "STEP":    "#88ddff",
+    "SETTINGS":"#aaaaaa",
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  AppLogger  –  thread-safe, routes to UI Text widget + file
+# ══════════════════════════════════════════════════════════════════════════════
+class AppLogger:
+    """
+    Call log(msg, level) from any thread.
+    Queues entries; the Tk main-thread polls and flushes to the Text widget.
+    """
+    def __init__(self):
+        self._queue: deque = deque()
+        self._lock  = threading.Lock()
+        self._widget: tk.Text | None = None
+        self._file_handle = None
+        try:
+            self._file_handle = open(LOG_FILE, "a", encoding="utf-8", buffering=1)
+        except Exception:
+            pass
+
+    def attach_widget(self, widget: tk.Text):
+        self._widget = widget
+
+    def log(self, msg: str, level: str = "INFO"):
+        ts    = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        entry = (ts, level.upper(), msg)
+        with self._lock:
+            self._queue.append(entry)
+        # also write to file immediately (thread-safe because buffering=1)
+        if self._file_handle:
+            try:
+                self._file_handle.write(f"[{ts}] [{level:7s}] {msg}\n")
+            except Exception:
+                pass
+
+    def flush_to_widget(self):
+        """Called from Tk main thread periodically."""
+        if not self._widget:
+            return
+        with self._lock:
+            entries = list(self._queue)
+            self._queue.clear()
+        if not entries:
+            return
+        w = self._widget
+        w.config(state=tk.NORMAL)
+        for ts, level, msg in entries:
+            tag = level if level in LOG_COLOURS else "INFO"
+            w.insert(tk.END, f"[{ts}] ", "TS")
+            w.insert(tk.END, f"[{level:7s}] ", tag)
+            w.insert(tk.END, f"{msg}\n", "MSG")
+        # trim to max lines
+        line_count = int(w.index(tk.END).split(".")[0]) - 1
+        if line_count > LOG_MAX_LINES:
+            w.delete("1.0", f"{line_count - LOG_MAX_LINES}.0")
+        w.see(tk.END)
+        w.config(state=tk.DISABLED)
+
+    def close(self):
+        if self._file_handle:
+            try:
+                self._file_handle.close()
+            except Exception:
+                pass
+
+
+# Global logger instance (created before app)
+logger = AppLogger()
+
 
 # ── camera open helper ────────────────────────────────────────────────────────
 def open_camera(index: int = 0):
-    """
-    Try multiple backends in order until one returns a valid frame.
-    Returns an opened cv2.VideoCapture or raises RuntimeError.
-
-    Order tried:
-      1. V4L2 explicit  (cv2.CAP_V4L2)          – best for USB on Pi4 + apt-opencv
-      2. Any backend    (cv2.CAP_ANY / 0)        – works on Windows / other Linux
-      3. GStreamer v4l2src pipeline               – fallback for custom GStreamer builds
-    """
     candidates = []
-
-    # 1. V4L2 direct (Pi4, Linux)
     if hasattr(cv2, "CAP_V4L2"):
-        candidates.append(
-            lambda: cv2.VideoCapture(index, cv2.CAP_V4L2)
-        )
-
-    # 2. Default / any backend
-    candidates.append(
-        lambda: cv2.VideoCapture(index)
-    )
-
-    # 3. GStreamer pipeline (Pi4 with gst-python opencv)
+        candidates.append(("V4L2", lambda: cv2.VideoCapture(index, cv2.CAP_V4L2)))
+    candidates.append(("ANY",  lambda: cv2.VideoCapture(index)))
     gst_pipe = (
         f"v4l2src device=/dev/video{index} "
         f"! video/x-raw,width={CAM_W},height={CAM_H},framerate={CAMERA_FPS}/1 "
@@ -117,34 +183,30 @@ def open_camera(index: int = 0):
         f"! video/x-raw,format=BGR "
         f"! appsink max-buffers=1 drop=true"
     )
-    candidates.append(
-        lambda: cv2.VideoCapture(gst_pipe, cv2.CAP_GSTREAMER)
-    )
+    candidates.append(("GST", lambda: cv2.VideoCapture(gst_pipe, cv2.CAP_GSTREAMER)))
 
-    for attempt, factory in enumerate(candidates, 1):
+    for name, factory in candidates:
         try:
             cap = factory()
             if not cap.isOpened():
                 cap.release()
-                print(f"[Camera] attempt {attempt}: isOpened=False, skipping")
+                logger.log(f"Camera [{name}] isOpened=False, skipping", "CAMERA")
                 continue
-            # verify we can actually read a frame
             ok, frame = cap.read()
             if not ok or frame is None:
                 cap.release()
-                print(f"[Camera] attempt {attempt}: read() failed, skipping")
+                logger.log(f"Camera [{name}] read() failed, skipping", "CAMERA")
                 continue
-            # configure resolution + fps (best-effort; ignored by GST pipeline)
             cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAM_W)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_H)
             cap.set(cv2.CAP_PROP_FPS,          CAMERA_FPS)
-            print(f"[Camera] attempt {attempt}: OK  "
-                  f"({int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x"
-                  f"{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))} "
-                  f"@ {cap.get(cv2.CAP_PROP_FPS):.0f}fps)")
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            logger.log(f"Camera [{name}] OK  {w}x{h} @ {fps:.0f}fps", "CAMERA")
             return cap
         except Exception as e:
-            print(f"[Camera] attempt {attempt}: exception – {e}")
+            logger.log(f"Camera [{name}] exception: {e}", "CAMERA")
 
     raise RuntimeError(
         "Cannot open camera. Check USB connection and /dev/video* permissions.\n"
@@ -162,23 +224,30 @@ def load_settings() -> dict:
             merged.update({k: v for k, v in data.items() if k not in TMPL_KEYS})
             for k in TMPL_KEYS:
                 merged[k] = {**_S_DEF, **data.get(k, {})}
+            logger.log(f"Settings loaded from {SETTINGS_FILE}", "SETTINGS")
             return merged
-        except Exception:
-            pass
+        except Exception as e:
+            logger.log(f"Settings load error: {e}, using defaults", "WARN")
+    logger.log("Using default settings", "SETTINGS")
     return {k: (dict(v) if isinstance(v, dict) else v)
             for k, v in DEFAULT_SETTINGS.items()}
 
 
 def save_settings(cfg: dict):
-    with open(SETTINGS_FILE, "w") as f:
-        json.dump(cfg, f, indent=2)
+    try:
+        with open(SETTINGS_FILE, "w") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception as e:
+        logger.log(f"Settings save error: {e}", "ERROR")
 
 
 def load_roi():
     if os.path.exists(ROI_FILE):
         try:
             with open(ROI_FILE) as f:
-                return tuple(json.load(f)["roi"])
+                roi = tuple(json.load(f)["roi"])
+            logger.log(f"ROI loaded: {roi}", "SETTINGS")
+            return roi
         except Exception:
             pass
     return DEFAULT_ROI
@@ -187,6 +256,7 @@ def load_roi():
 def save_roi(roi):
     with open(ROI_FILE, "w") as f:
         json.dump({"roi": list(roi)}, f)
+    logger.log(f"ROI saved: {roi}", "SETTINGS")
 
 
 def load_template_pil(name):
@@ -199,30 +269,65 @@ def load_template_pil(name):
         return None
 
 
-def load_template_gray(name):
+def load_template_bgr(name):
     p = os.path.join(TEMPLATE_DIR, name)
     if not os.path.exists(p):
         return None
-    img = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
+    img = cv2.imread(p, cv2.IMREAD_COLOR)
+    if img is None:
+        logger.log(f"cv2.imread failed for {name}", "WARN")
     return img
 
 
-def do_template_match(scene_bgr, tmpl_gray, roi, threshold_pct) -> bool:
-    if tmpl_gray is None:
-        return False
+def do_template_match(scene_bgr, tmpl_bgr, roi, threshold_pct) -> tuple[bool, float]:
+    """
+    Template matching với ROI.
+
+    Cả scene lẫn template đều được capture từ full frame (640×480),
+    nên cả 2 cần được cắt theo ROI trước khi match:
+
+      tmpl_crop  = tmpl_bgr  cắt đúng ROI           → đây là pattern cần tìm
+      scene_crop = scene_bgr cắt ROI mở rộng 10%    → đây là vùng tìm kiếm
+
+    ROI mở rộng 10% đảm bảo scene_crop luôn lớn hơn tmpl_crop,
+    đáp ứng yêu cầu của cv2.matchTemplate (scene >= template về cả W và H).
+
+    Returns (passed: bool, score: float 0.0–1.0)
+    """
+    if tmpl_bgr is None:
+        return False, 0.0
+
     x, y, w, h = roi
     fh, fw = scene_bgr.shape[:2]
-    x1, y1 = max(0, x), max(0, y)
-    x2, y2 = min(fw, x + w), min(fh, y + h)
-    if x2 <= x1 or y2 <= y1:
-        return False
-    crop = cv2.cvtColor(scene_bgr[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
-    th, tw = tmpl_gray.shape[:2]
-    if crop.shape[0] < th or crop.shape[1] < tw:
-        return False
-    res = cv2.matchTemplate(crop, tmpl_gray, cv2.TM_CCOEFF_NORMED)
+
+    # ── template crop: đúng ROI, convert sang gray ────────────────────────────
+    tx1, ty1 = max(0, x),       max(0, y)
+    tx2, ty2 = min(fw, x + w),  min(fh, y + h)
+    if tx2 <= tx1 or ty2 <= ty1:
+        return False, 0.0
+
+    tmpl_crop = cv2.cvtColor(tmpl_bgr[ty1:ty2, tx1:tx2], cv2.COLOR_BGR2GRAY)
+
+    # ── scene crop: ROI mở rộng 10% mỗi chiều ────────────────────────────────
+    pad_x = max(1, int(w * 0.10))
+    pad_y = max(1, int(h * 0.10))
+
+    sx1 = max(0,  x - pad_x)
+    sy1 = max(0,  y - pad_y)
+    sx2 = min(fw, x + w + pad_x)
+    sy2 = min(fh, y + h + pad_y)
+
+    scene_crop = cv2.cvtColor(scene_bgr[sy1:sy2, sx1:sx2], cv2.COLOR_BGR2GRAY)
+
+    # ── sanity check: scene phải >= template ─────────────────────────────────
+    th, tw = tmpl_crop.shape[:2]
+    sh, sw = scene_crop.shape[:2]
+    if sh < th or sw < tw:
+        return False, 0.0
+
+    res = cv2.matchTemplate(scene_crop, tmpl_crop, cv2.TM_CCOEFF_NORMED)
     _, max_val, _, _ = cv2.minMaxLoc(res)
-    return max_val >= (threshold_pct / 100.0)
+    return max_val >= (threshold_pct / 100.0), round(float(max_val), 4)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -232,7 +337,7 @@ class CheckApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("check app")
-        self.geometry("1280x720")
+        self.geometry("1280x920")
         self.resizable(False, False)
 
         cfg = load_settings()
@@ -253,7 +358,14 @@ class CheckApp(tk.Tk):
             v.trace_add("write", lambda *_: self._save_settings_now())
 
         # ── template data ─────────────────────────────────────────────────────
-        self._tmpl_gray = [load_template_gray(n) for n in TMPL_NAMES]
+        self._tmpl_bgr = []
+        for n in TMPL_NAMES:
+            g = load_template_bgr(n)
+            self._tmpl_bgr.append(g)
+            if g is not None:
+                logger.log(f"Template loaded: {n}  ({g.shape[1]}x{g.shape[0]})", "INFO")
+            else:
+                logger.log(f"Template NOT found: {n}", "WARN")
 
         # ── workflow state ────────────────────────────────────────────────────
         self._step           = 0
@@ -268,12 +380,12 @@ class CheckApp(tk.Tk):
         self._draw_rect_id = None
 
         # ── camera ───────────────────────────────────────────────────────────
+        logger.log("Opening camera...", "CAMERA")
         try:
             self._cap = open_camera(0)
         except RuntimeError as e:
-            # Show error in a label and continue without camera
             self._cap = None
-            print(f"[Camera] FATAL: {e}", file=sys.stderr)
+            logger.log(f"FATAL – camera unavailable: {e}", "ERROR")
 
         self._frame           = None
         self._lock            = threading.Lock()
@@ -283,6 +395,9 @@ class CheckApp(tk.Tk):
         # ── GPIO poll ─────────────────────────────────────────────────────────
         if _HAS_GPIO:
             threading.Thread(target=self._gpio_poll_loop, daemon=True).start()
+            logger.log("GPIO poll thread started (GPIO27=STAMP, GPIO17=RELAY)", "GPIO")
+        else:
+            logger.log("GPIO disabled (dev mode)", "GPIO")
 
         # ── UI ───────────────────────────────────────────────────────────────
         self._tmpl_photo_refs    = [None] * 4
@@ -290,11 +405,23 @@ class CheckApp(tk.Tk):
         self._thresh_lbl_widgets = []
         self._step_indicators    = []
         self._stamp_btn          = None
-        self._cam_status_lbl     = None   # shows camera error on canvas
+        self._log_text           = None   # tk.Text widget for log panel
 
         self._build_ui()
+
+        # attach logger to widget and start polling
+        logger.attach_widget(self._log_text)
+        self._poll_log()
+
         self._update_display()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        logger.log("App initialised. GPIO={} Pi={}".format(_HAS_GPIO, _IS_PI), "INFO")
+
+    # ── log poll (Tk main thread, every 200 ms) ───────────────────────────────
+    def _poll_log(self):
+        logger.flush_to_widget()
+        self.after(200, self._poll_log)
 
     # ── settings ──────────────────────────────────────────────────────────────
     def _save_settings_now(self):
@@ -309,7 +436,7 @@ class CheckApp(tk.Tk):
                       "threshold": self._thresh_vars[i].get()}
         save_settings(cfg)
 
-    # ── UI ────────────────────────────────────────────────────────────────────
+    # ── UI build ──────────────────────────────────────────────────────────────
     def _build_ui(self):
         self.columnconfigure(0, weight=0)
         self.columnconfigure(1, weight=1)
@@ -318,12 +445,14 @@ class CheckApp(tk.Tk):
         # ════ COL 0 ═══════════════════════════════════════════════════════════
         col0 = tk.Frame(self)
         col0.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
-        col0.rowconfigure(0, weight=0)
-        col0.rowconfigure(1, weight=0)
-        col0.rowconfigure(2, weight=0)
-        col0.rowconfigure(3, weight=1)
+        col0.columnconfigure(0, weight=1)
+        col0.rowconfigure(0, weight=0)   # controls bar
+        col0.rowconfigure(1, weight=0)   # workflow panel
+        col0.rowconfigure(2, weight=0)   # STAMP button
+        col0.rowconfigure(3, weight=0)   # camera canvas (fixed size)
+        col0.rowconfigure(4, weight=1)   # log panel (expands)
 
-        # top controls bar
+        # ── row 0: top controls bar ───────────────────────────────────────────
         ctrl = tk.Frame(col0, bd=1, relief=tk.RIDGE)
         ctrl.grid(row=0, column=0, sticky="ew", padx=2, pady=2)
 
@@ -352,7 +481,7 @@ class CheckApp(tk.Tk):
                        variable=self._isFinalMatch
                        ).pack(side=tk.LEFT, padx=4, pady=4)
 
-        # workflow panel
+        # ── row 1: workflow panel ─────────────────────────────────────────────
         wf_outer = tk.Frame(col0, bd=1, relief=tk.SUNKEN)
         wf_outer.grid(row=1, column=0, sticky="ew", padx=2, pady=2)
 
@@ -373,7 +502,7 @@ class CheckApp(tk.Tk):
                                     fg="#cc8800", anchor="w", bg="#1a1a2e")
         self._status_lbl.pack(fill=tk.X, padx=6, pady=2)
 
-        # STAMP button
+        # ── row 2: STAMP button ───────────────────────────────────────────────
         self._stamp_btn = tk.Button(
             col0,
             text="STAMP",
@@ -386,13 +515,12 @@ class CheckApp(tk.Tk):
         )
         self._stamp_btn.grid(row=2, column=0, sticky="e", padx=10, pady=4)
 
-        # camera canvas
+        # ── row 3: camera canvas ──────────────────────────────────────────────
         self._canvas = tk.Canvas(col0,
                                  width=self.DISP_W, height=self.DISP_H,
                                  bg="#111111", cursor="crosshair")
         self._canvas.grid(row=3, column=0, padx=2, pady=2)
 
-        # camera error overlay (shown when _cap is None)
         if self._cap is None:
             self._canvas.create_text(
                 self.DISP_W // 2, self.DISP_H // 2,
@@ -404,6 +532,49 @@ class CheckApp(tk.Tk):
         self._canvas.bind("<ButtonPress-1>",   self._roi_mouse_press)
         self._canvas.bind("<B1-Motion>",       self._roi_mouse_drag)
         self._canvas.bind("<ButtonRelease-1>", self._roi_mouse_release)
+
+        # ── row 4: log panel ──────────────────────────────────────────────────
+        log_frame = tk.LabelFrame(col0, text="App Log",
+                                  font=("Arial", 8, "bold"),
+                                  bd=1, relief=tk.RIDGE)
+        log_frame.grid(row=4, column=0, sticky="nsew", padx=2, pady=(2, 4))
+        log_frame.rowconfigure(0, weight=1)
+        log_frame.columnconfigure(0, weight=1)
+
+        self._log_text = tk.Text(
+            log_frame,
+            height=8,
+            bg="#0d0d0d", fg="#cccccc",
+            font=("Courier", 8),
+            state=tk.DISABLED,
+            wrap=tk.NONE,
+            relief=tk.FLAT,
+            bd=0,
+            selectbackground="#334455",
+        )
+        self._log_text.grid(row=0, column=0, sticky="nsew")
+
+        # scrollbars
+        vsb = ttk.Scrollbar(log_frame, orient=tk.VERTICAL,
+                            command=self._log_text.yview)
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb = ttk.Scrollbar(log_frame, orient=tk.HORIZONTAL,
+                            command=self._log_text.xview)
+        hsb.grid(row=1, column=0, sticky="ew")
+        self._log_text.config(yscrollcommand=vsb.set,
+                               xscrollcommand=hsb.set)
+
+        # Clear log button
+        tk.Button(log_frame, text="Clear", font=("Arial", 7),
+                  pady=0, padx=4,
+                  command=self._clear_log
+                  ).grid(row=1, column=1, sticky="e", padx=2, pady=1)
+
+        # configure text tags for coloured output
+        self._log_text.tag_config("TS",  foreground="#556677")
+        self._log_text.tag_config("MSG", foreground="#aaaaaa")
+        for tag, colour in LOG_COLOURS.items():
+            self._log_text.tag_config(tag, foreground=colour)
 
         self._update_step_ui()
 
@@ -463,6 +634,14 @@ class CheckApp(tk.Tk):
 
             self._tmpl_lbl_widgets.append(lbl_w)
 
+    # ── log helpers ───────────────────────────────────────────────────────────
+    def _clear_log(self):
+        if self._log_text:
+            self._log_text.config(state=tk.NORMAL)
+            self._log_text.delete("1.0", tk.END)
+            self._log_text.config(state=tk.DISABLED)
+        logger.log("Log cleared", "INFO")
+
     # ── step highlight ────────────────────────────────────────────────────────
     def _update_step_ui(self):
         active = self._step if self._step < STEP_READY else STEP_READY
@@ -490,29 +669,39 @@ class CheckApp(tk.Tk):
             self._busy        = False
             self._frame_count = 0
             self._status_text.set(STEPS[0][1])
+            logger.log("▶ Running STARTED – workflow reset to step 0", "STEP")
         else:
             self._isReady = False
+            logger.log("■ Running STOPPED", "STEP")
         self._update_step_ui()
 
     # ── thresh ────────────────────────────────────────────────────────────────
     def _on_thresh_change(self, val, idx):
-        self._thresh_lbl_widgets[idx].config(text=f"{int(float(val))}%")
+        v = int(float(val))
+        self._thresh_lbl_widgets[idx].config(text=f"{v}%")
+        logger.log(f"Threshold {TMPL_LABELS[idx]} → {v}%", "SETTINGS")
 
     # ── capture template ──────────────────────────────────────────────────────
     def _capture_template(self, fname, idx):
         if self._isRunning.get():
+            logger.log(f"Capture {fname} blocked – app is Running", "WARN")
             return
         with self._lock:
             frame = self._frame.copy() if self._frame is not None else None
         if frame is None:
+            logger.log(f"Capture {fname} failed – no camera frame", "ERROR")
             return
         dest = os.path.join(TEMPLATE_DIR, fname)
         if os.path.exists(dest):
             stem, ext = os.path.splitext(fname)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            shutil.move(dest, os.path.join(STALE_DIR, f"{stem}_{ts}{ext}"))
+            stale = os.path.join(STALE_DIR, f"{stem}_{ts}{ext}")
+            shutil.move(dest, stale)
+            logger.log(f"Archived old {fname} → template_stale/", "INFO")
         cv2.imwrite(dest, frame)
-        self._tmpl_gray[idx] = load_template_gray(fname)
+        self._tmpl_bgr[idx] = load_template_bgr(fname)
+        h, w = frame.shape[:2]
+        logger.log(f"Captured {fname}  {w}x{h}", "OK")
         self._refresh_template_ui(fname, idx)
 
     def _refresh_template_ui(self, fname, idx):
@@ -531,8 +720,9 @@ class CheckApp(tk.Tk):
 
     # ── camera capture thread ─────────────────────────────────────────────────
     def _capture_loop(self):
-        interval = 1.0 / CAMERA_FPS
+        interval          = 1.0 / CAMERA_FPS
         consecutive_fails = 0
+        logger.log(f"Capture thread started  target={CAMERA_FPS}fps", "CAMERA")
 
         while self._running_capture:
             t0 = time.time()
@@ -545,24 +735,24 @@ class CheckApp(tk.Tk):
 
             if not ret or frame is None:
                 consecutive_fails += 1
+                if consecutive_fails == 1:
+                    logger.log("Camera read() failed", "CAMERA")
                 if consecutive_fails >= 10:
-                    # try to reopen
-                    print("[Camera] Too many read failures – attempting reopen...")
+                    logger.log("10 consecutive failures – trying to reopen camera", "WARN")
                     self._cap.release()
                     time.sleep(1.0)
                     try:
                         self._cap = open_camera(0)
                         consecutive_fails = 0
-                        print("[Camera] Reopened OK")
+                        logger.log("Camera reopened OK", "CAMERA")
                     except RuntimeError as e:
-                        print(f"[Camera] Reopen failed: {e}")
+                        logger.log(f"Camera reopen failed: {e}", "ERROR")
                         self._cap = None
                 time.sleep(0.1)
                 continue
 
             consecutive_fails = 0
 
-            # ensure BGR frame is correct size
             fh, fw = frame.shape[:2]
             if fw != CAM_W or fh != CAM_H:
                 frame = cv2.resize(frame, (CAM_W, CAM_H),
@@ -589,19 +779,32 @@ class CheckApp(tk.Tk):
             frame = self._frame.copy() if self._frame is not None else None
         if frame is None:
             return
-        tmpl_idx, _ = STEPS[self._step]
-        passed = do_template_match(frame, self._tmpl_gray[tmpl_idx],
-                                   self._roi, self._thresh_vars[tmpl_idx].get())
+
+        tmpl_idx, step_desc = STEPS[self._step]
+        thresh = self._thresh_vars[tmpl_idx].get()
+        passed, score = do_template_match(frame, self._tmpl_bgr[tmpl_idx],
+                                          self._roi, thresh)
+
+        logger.log(
+            f"Match {TMPL_LABELS[tmpl_idx]}  score={score:.3f}  "
+            f"thresh={thresh}%  → {'PASS' if passed else 'fail'}",
+            "MATCH"
+        )
+
         if not passed:
             return
+
         next_step = self._step + 1
         if next_step >= len(STEPS):
             self._step    = STEP_READY
             self._isReady = True
+            logger.log("All steps matched → READY", "STEP")
             self.after(0, self._on_ready)
         else:
             self._step = next_step
             desc = STEPS[next_step][1]
+            logger.log(f"Step advance → {TMPL_LABELS[next_step-1]} matched  "
+                       f"next: {desc}", "STEP")
             self.after(0, lambda d=desc: (self._status_text.set(d),
                                           self._update_step_ui()))
 
@@ -616,40 +819,52 @@ class CheckApp(tk.Tk):
         while self._running_capture:
             cur = GPIO.input(27)
             if last and not cur:
+                logger.log("GPIO27 falling edge – STAMP triggered", "GPIO")
                 self.after(0, self._on_stamp_physical)
             last = cur
             time.sleep(0.02)
 
     # ── stamp ─────────────────────────────────────────────────────────────────
     def _on_stamp_ui_click(self):
+        logger.log("UI STAMP button clicked", "STAMP")
         self._try_stamp()
 
     def _on_stamp_physical(self):
+        logger.log("Physical STAMP button pressed", "STAMP")
         self._try_stamp()
 
     def _try_stamp(self):
         if self._busy:
+            logger.log("STAMP ignored – already busy", "WARN")
             return
         if self._isRunning.get():
             if not self._isReady:
+                logger.log("STAMP ignored – not READY", "WARN")
                 return
         else:
             now = time.time()
             if now - self._last_dev_stamp < DEV_STAMP_COOLDOWN:
                 rem = DEV_STAMP_COOLDOWN - (now - self._last_dev_stamp)
-                self._status_text.set(f"⏳ Cooldown {rem:.1f}s")
+                msg = f"⏳ Cooldown {rem:.1f}s"
+                self._status_text.set(msg)
+                logger.log(f"STAMP ignored – dev cooldown {rem:.1f}s remaining", "WARN")
                 return
             self._last_dev_stamp = now
         self._busy = True
+        logger.log("STAMP sequence starting...", "STAMP")
         threading.Thread(target=self._stamp_sequence, daemon=True).start()
 
     def _stamp_sequence(self):
+        # optional final match
         if self._isRunning.get() and self._isFinalMatch.get():
             with self._lock:
                 frame = self._frame.copy() if self._frame is not None else None
             if frame is not None:
-                passed = do_template_match(frame, self._tmpl_gray[3],
-                                           self._roi, self._thresh_vars[3].get())
+                thresh = self._thresh_vars[3].get()
+                passed, score = do_template_match(frame, self._tmpl_bgr[3],
+                                                  self._roi, thresh)
+                logger.log(f"FinalMatch S4  score={score:.3f}  thresh={thresh}%  "
+                           f"→ {'PASS' if passed else 'FAIL'}", "STAMP")
                 if not passed:
                     self.after(0, lambda: self._status_text.set(
                         "✘ FinalMatch FAIL – re-check Hood"))
@@ -662,21 +877,27 @@ class CheckApp(tk.Tk):
         if _HAS_GPIO:
             import RPi.GPIO as GPIO
             GPIO.output(17, GPIO.LOW)
+            logger.log(f"Relay ON (GPIO17 LOW)  pulse={RELAY_MS}ms", "GPIO")
             time.sleep(RELAY_MS / 1000.0)
             GPIO.output(17, GPIO.HIGH)
+            logger.log("Relay OFF (GPIO17 HIGH)", "GPIO")
         else:
+            logger.log(f"[sim] Relay pulse {RELAY_MS}ms", "STAMP")
             time.sleep(RELAY_MS / 1000.0)
 
         if self._isRunning.get():
+            logger.log(f"Post-stamp wait {POST_STAMP_WAIT:.0f}s", "STAMP")
             self.after(0, lambda: self._status_text.set(
                 f"⏳ Waiting {POST_STAMP_WAIT:.0f}s..."))
             time.sleep(POST_STAMP_WAIT)
             self._step    = 0
             self._isReady = False
             self._busy    = False
+            logger.log("Cycle complete – reset to step 0", "STEP")
             self.after(0, self._reset_cycle)
         else:
             self._busy = False
+            logger.log("Dev stamp complete", "STAMP")
             self.after(0, self._update_step_ui)
 
     def _reset_cycle(self):
@@ -730,6 +951,7 @@ class CheckApp(tk.Tk):
             self._roi = [rx, ry, rw, rh]
             save_roi(tuple(self._roi))
             self._roi_label.config(text=self._roi_text())
+            logger.log(f"ROI updated: x={rx} y={ry} w={rw} h={rh}", "INFO")
         self._draw_start = None
         if self._draw_rect_id:
             self._canvas.delete(self._draw_rect_id)
@@ -737,6 +959,7 @@ class CheckApp(tk.Tk):
 
     # ── cleanup ───────────────────────────────────────────────────────────────
     def _on_close(self):
+        logger.log("App closing...", "INFO")
         self._save_settings_now()
         self._running_capture = False
         if self._cap is not None:
@@ -744,6 +967,8 @@ class CheckApp(tk.Tk):
         if _HAS_GPIO:
             import RPi.GPIO as GPIO
             GPIO.cleanup()
+            logger.log("GPIO cleanup done", "GPIO")
+        logger.close()
         self.destroy()
 
 
