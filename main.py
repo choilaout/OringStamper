@@ -2,7 +2,7 @@
 check_app.py  –  Raspberry Pi 4B  |  USB camera  |  Template matching
 Assembly sequence:  S1(empty) → S2(product) → S3(+O-ring) → S4(+Hood) → STAMP
 GPIO 27 = STAMP button (pull-up, active LOW)
-GPIO 17 = relay output (active LOW, 375 ms pulse)
+GPIO 17 = relay output (active HIGH, 375 ms pulse)
 
 Layout 1280×920
   COL 0 (fixed):  controls bar | workflow panel | STAMP btn | camera 640×480
@@ -22,18 +22,18 @@ _IS_PI = os.path.exists("/sys/firmware/devicetree/base/model")
 
 # ── GPIO ─────────────────────────────────────────────────────────────────────
 # GPIO_BLOCK_START  ← uncomment on Pi
-# try:
-#     import RPi.GPIO as GPIO
-#     GPIO.setmode(GPIO.BCM)
-#     GPIO.setup(27, GPIO.IN,  pull_up_down=GPIO.PUD_UP)
-#     GPIO.setup(17, GPIO.OUT, initial=GPIO.HIGH)
-#     _HAS_GPIO = True
-#     print("[GPIO] initialised OK")
-# except Exception as _e:
-#     print(f"[GPIO] not available: {_e}")
-#     _HAS_GPIO = False
+try:
+    import RPi.GPIO as GPIO
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setup(27, GPIO.IN,  pull_up_down=GPIO.PUD_UP)
+    GPIO.setup(17, GPIO.OUT, initial=GPIO.LOW)
+    _HAS_GPIO = True
+    print("[GPIO] initialised OK")
+except Exception as _e:
+    print(f"[GPIO] not available: {_e}")
+    _HAS_GPIO = False
 # GPIO_BLOCK_END
-_HAS_GPIO = False   # ← remove when deploying on Pi
+# _HAS_GPIO = False   # ← remove when deploying on Pi
 
 # ── paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
@@ -1066,10 +1066,10 @@ class CheckApp(tk.Tk):
 
         if _HAS_GPIO:
             import RPi.GPIO as GPIO
-            GPIO.output(17, GPIO.LOW)
+            GPIO.output(17, GPIO.HIGH)
             logger.log(f"Relay ON  pulse={RELAY_MS}ms", "GPIO")
             time.sleep(RELAY_MS / 1000.0)
-            GPIO.output(17, GPIO.HIGH)
+            GPIO.output(17, GPIO.LOW)
             logger.log("Relay OFF", "GPIO")
         else:
             logger.log(f"[sim] Relay pulse {RELAY_MS}ms", "STAMP")
