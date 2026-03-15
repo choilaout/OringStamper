@@ -407,8 +407,9 @@ class CheckApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("check app")
-        self.geometry("1280x920")
-        self.resizable(False, False)
+        self.configure(bg="black")
+        self.attributes("-fullscreen", True)
+        self.bind("<Escape>", lambda e: self.attributes("-fullscreen", False))
 
         cfg = load_settings()
 
@@ -526,13 +527,22 @@ class CheckApp(tk.Tk):
     #  UI BUILD
     # ══════════════════════════════════════════════════════════════════════════
     def _build_ui(self):
-        # root grid: 2 columns, 2 rows
-        #   row 0 (weight=0): Process Step spanning both columns (full width)
-        #   row 1 (weight=1): col0 = camera panel, col1 = Counter + Log
-        self.columnconfigure(0, weight=0)   # col0 fixed
-        self.columnconfigure(1, weight=1)   # col1 expands
-        self.rowconfigure(0, weight=0)      # process step bar (full-width)
-        self.rowconfigure(1, weight=1)      # main content
+        # Root is fullscreen black canvas.
+        # All content lives in a centred 1280×920 inner frame.
+        # The surrounding area is pure black.
+        self.rowconfigure(0, weight=1)
+        self.columnconfigure(0, weight=1)
+
+        self._inner = tk.Frame(self, bg="black",
+                               width=1280, height=920)
+        self._inner.grid(row=0, column=0)   # centred by default in grid
+        self._inner.grid_propagate(False)   # hold fixed 1280×920
+
+        # inner grid: 2 columns, 2 rows (same logic as before)
+        self._inner.columnconfigure(0, weight=0)   # col0 fixed
+        self._inner.columnconfigure(1, weight=1)   # col1 expands
+        self._inner.rowconfigure(0, weight=0)      # process step bar
+        self._inner.rowconfigure(1, weight=1)      # main content
 
         self._build_process_step_row()
         self._build_col0()
@@ -540,7 +550,7 @@ class CheckApp(tk.Tk):
 
     # ── COL 0: controls | workflow | STAMP | camera ───────────────────────────
     def _build_col0(self):
-        col0 = tk.Frame(self)
+        col0 = tk.Frame(self._inner)
         col0.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
         col0.columnconfigure(0, weight=1)
         col0.rowconfigure(0, weight=0)   # controls bar
@@ -638,7 +648,7 @@ class CheckApp(tk.Tk):
 
     # ── _build_process_step_row: full-width row 0 spanning both columns ────────
     def _build_process_step_row(self):
-        ps_outer = tk.LabelFrame(self, text="Process Step",
+        ps_outer = tk.LabelFrame(self._inner, text="Process Step",
                                  font=("Arial", 9, "bold"),
                                  bd=1, relief=tk.RIDGE)
         ps_outer.grid(row=0, column=0, columnspan=2,
@@ -708,7 +718,7 @@ class CheckApp(tk.Tk):
 
     # ── COL 1: Counter | App Log ──────────────────────────────────────────────
     def _build_col1(self):
-        col1 = tk.Frame(self)
+        col1 = tk.Frame(self._inner)
         col1.grid(row=1, column=1, sticky="nsew", padx=4, pady=4)
         col1.columnconfigure(0, weight=1)
         col1.rowconfigure(0, weight=0)   # Counter
