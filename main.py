@@ -490,6 +490,9 @@ class CheckApp(tk.Tk):
         self._update_counters()   # start 1-second ticker
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # ── hotkeys ───────────────────────────────────────────────────────────
+        self._bind_hotkeys()
         logger.log(f"App ready  GPIO={_HAS_GPIO}  Pi={_IS_PI}", "INFO")
 
     # ── log poll ──────────────────────────────────────────────────────────────
@@ -509,6 +512,43 @@ class CheckApp(tk.Tk):
                 text=f"Stamps:  {self._history.stamp_count}"
             )
         self.after(1000, self._update_counters)
+
+    # ── hotkeys ──────────────────────────────────────────────────────────────
+    def _bind_hotkeys(self):
+        """
+        Ctrl+1..4  → Capture S1..S4   (blocked when Running, same as button)
+        Ctrl+R     → Toggle Running
+        Ctrl+S     → STAMP             (same gate logic as UI button)
+        Esc        → exit fullscreen   (already bound in __init__)
+        """
+        for i in range(4):
+            # bind both <Control-1> and <Control-KP_1> (numpad)
+            self.bind(f"<Control-Key-{i+1}>",
+                      lambda e, idx=i: self._hotkey_capture(idx))
+
+        self.bind("<Control-r>", lambda e: self._hotkey_running())
+        self.bind("<Control-R>", lambda e: self._hotkey_running())
+        self.bind("<Control-s>", lambda e: self._hotkey_stamp())
+        self.bind("<Control-S>", lambda e: self._hotkey_stamp())
+
+        logger.log(
+            "Hotkeys: Ctrl+1-4=Capture  Ctrl+R=Running  Ctrl+S=Stamp", "INFO"
+        )
+
+    def _hotkey_capture(self, idx: int):
+        fname = TMPL_NAMES[idx]
+        logger.log(f"Hotkey Ctrl+{idx+1} → Capture {TMPL_LABELS[idx]}", "INFO")
+        self._capture_template(fname, idx)
+
+    def _hotkey_running(self):
+        new_val = not self._isRunning.get()
+        self._isRunning.set(new_val)
+        logger.log(f"Hotkey Ctrl+R → Running={'ON' if new_val else 'OFF'}", "INFO")
+        self._on_running_toggle()
+
+    def _hotkey_stamp(self):
+        logger.log("Hotkey Ctrl+S → STAMP", "STAMP")
+        self._on_stamp_ui_click()
 
     # ── settings ──────────────────────────────────────────────────────────────
     def _save_settings_now(self):
